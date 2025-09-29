@@ -68,6 +68,15 @@ class VideoDurationTrim:
                 # 如果video对象有write_to_file方法
                 temp_input_path = os.path.join(temp_dir, "input_video.mp4")
                 video.write_to_file(temp_input_path)
+            elif hasattr(video, "save") and callable(getattr(video, "save")):
+                # 处理VideoFromComponents等有save方法的对象
+                temp_input_path = os.path.join(temp_dir, "input_video.mp4")
+                video.save(temp_input_path)
+            elif hasattr(video, "write_to") and callable(getattr(video, "write_to")):
+                # 处理可能有write_to方法的视频对象
+                temp_input_path = os.path.join(temp_dir, "input_video.mp4")
+                with open(temp_input_path, "wb") as f:
+                    video.write_to(f)
             elif isinstance(video, (str, os.PathLike)):
                 # 如果是文件路径
                 temp_input_path = str(video)
@@ -82,20 +91,55 @@ class VideoDurationTrim:
                     else:
                         f.write(video.read())
             else:
-                # 尝试其他可能的VIDEO类型处理方式
+                # 处理VideoFromComponents等复杂视频对象
                 temp_input_path = os.path.join(temp_dir, "input_video.mp4")
-                # 假设video对象可以直接写入文件
-                try:
-                    with open(temp_input_path, "wb") as f:
-                        if hasattr(video, "tobytes"):
-                            f.write(video.tobytes())
-                        else:
-                            # 最后的尝试 - 假设它是某种可迭代的字节数据
-                            f.write(bytes(video))
-                except Exception as e:
-                    raise ValueError(
-                        f"无法处理输入的视频格式: {type(video)}, 错误: {str(e)}"
-                    )
+                saved = False
+                error_messages = []
+
+                # 尝试多种可能的保存方法
+                save_methods = [
+                    ("save", lambda v, p: v.save(p)),
+                    ("write_video", lambda v, p: v.write_video(p)),
+                    ("to_file", lambda v, p: v.to_file(p)),
+                    ("export", lambda v, p: v.export(p)),
+                    ("save_to", lambda v, p: v.save_to(p)),
+                ]
+
+                for method_name, method_func in save_methods:
+                    if hasattr(video, method_name):
+                        try:
+                            method_func(video, temp_input_path)
+                            saved = True
+                            print(f"成功使用 {method_name} 方法保存视频")
+                            break
+                        except Exception as e:
+                            error_messages.append(f"{method_name}: {str(e)}")
+                            continue
+
+                # 如果所有保存方法都失败了，尝试字节数据方法
+                if not saved:
+                    try:
+                        with open(temp_input_path, "wb") as f:
+                            if hasattr(video, "tobytes"):
+                                f.write(video.tobytes())
+                                saved = True
+                                print("成功使用 tobytes 方法保存视频")
+                            elif hasattr(video, "read"):
+                                video_data = video.read()
+                                f.write(video_data)
+                                saved = True
+                                print("成功使用 read 方法保存视频")
+                    except Exception as e:
+                        error_messages.append(f"tobytes/read: {str(e)}")
+
+                if not saved:
+                    available_methods = [
+                        attr for attr in dir(video) if not attr.startswith("_")
+                    ]
+                    error_msg = f"无法处理输入的视频格式: {type(video)}\n"
+                    error_msg += f"尝试的方法失败: {'; '.join(error_messages)}\n"
+                    error_msg += f"对象可用方法: {', '.join(available_methods[:20])}..."
+                    raise ValueError(error_msg)
 
             # 验证输入文件
             if not os.path.exists(temp_input_path):
