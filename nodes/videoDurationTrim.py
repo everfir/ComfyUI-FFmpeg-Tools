@@ -5,6 +5,14 @@ import shutil
 from io import BytesIO
 from ..func import set_file_name, video_type
 
+# 导入ComfyUI的文件路径管理
+try:
+    import folder_paths
+
+    COMFYUI_INTEGRATION = True
+except ImportError:
+    COMFYUI_INTEGRATION = False
+
 
 class VideoDurationTrim:
     """
@@ -36,7 +44,14 @@ class VideoDurationTrim:
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "可选的输出路径，如果为空则使用临时目录",
+                        "tooltip": "可选的输出路径。留空使用临时目录，输入'output'使用ComfyUI输出目录",
+                    },
+                ),
+                "save_to_output": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "是否保存到ComfyUI的output目录（会被ComfyUI管理，不会自动清理）",
                     },
                 ),
             },
@@ -48,7 +63,9 @@ class VideoDurationTrim:
     OUTPUT_NODE = False  # 设为False，因为我们返回VIDEO类型而不是最终输出
     CATEGORY = "🔥FFmpeg"
 
-    def trim_video_by_duration(self, video, duration, output_path=""):
+    def trim_video_by_duration(
+        self, video, duration, output_path="", save_to_output=False
+    ):
         """
         根据duration裁剪视频，从0秒开始到指定时长
         """
@@ -56,8 +73,15 @@ class VideoDurationTrim:
         temp_output_path = None
 
         try:
-            # 创建临时目录
-            temp_dir = tempfile.mkdtemp(prefix="comfyui_video_trim_")
+            # 创建临时目录 - 优先使用ComfyUI的temp目录
+            if COMFYUI_INTEGRATION:
+                comfyui_temp_dir = folder_paths.get_temp_directory()
+                os.makedirs(comfyui_temp_dir, exist_ok=True)
+                temp_dir = tempfile.mkdtemp(prefix="video_trim_", dir=comfyui_temp_dir)
+                print(f"使用ComfyUI temp目录: {temp_dir}")
+            else:
+                temp_dir = tempfile.mkdtemp(prefix="comfyui_video_trim_")
+                print(f"使用系统temp目录: {temp_dir}")
 
             # 处理输入视频 - 将VIDEO类型保存到临时文件
             if hasattr(video, "save_video"):
@@ -157,19 +181,37 @@ class VideoDurationTrim:
                 raise ValueError("duration必须大于0")
 
             # 确定输出路径
-            if output_path and output_path.strip():
-                output_path = os.path.abspath(output_path.strip())
-                if os.path.isdir(output_path):
-                    file_name = set_file_name(temp_input_path)
-                    temp_output_path = os.path.join(output_path, file_name)
+            file_name = set_file_name(temp_input_path)
+
+            if save_to_output and COMFYUI_INTEGRATION:
+                # 保存到ComfyUI的output目录
+                output_dir = folder_paths.get_output_directory()
+                video_subdir = os.path.join(output_dir, "video_trim")
+                os.makedirs(video_subdir, exist_ok=True)
+                temp_output_path = os.path.join(video_subdir, f"trimmed_{file_name}")
+                print(f"保存到ComfyUI output目录: {temp_output_path}")
+            elif output_path and output_path.strip():
+                # 用户指定路径
+                if output_path.strip().lower() == "output" and COMFYUI_INTEGRATION:
+                    # 特殊关键词：使用ComfyUI output目录
+                    output_dir = folder_paths.get_output_directory()
+                    temp_output_path = os.path.join(output_dir, f"trimmed_{file_name}")
                 else:
-                    temp_output_path = output_path
-                    # 确保输出目录存在
-                    os.makedirs(os.path.dirname(temp_output_path), exist_ok=True)
+                    # 用户自定义路径
+                    output_path = os.path.abspath(output_path.strip())
+                    if os.path.isdir(output_path):
+                        temp_output_path = os.path.join(
+                            output_path, f"trimmed_{file_name}"
+                        )
+                    else:
+                        temp_output_path = output_path
+                        # 确保输出目录存在
+                        os.makedirs(os.path.dirname(temp_output_path), exist_ok=True)
+                print(f"保存到用户指定路径: {temp_output_path}")
             else:
                 # 使用临时目录
-                file_name = set_file_name(temp_input_path)
                 temp_output_path = os.path.join(temp_dir, f"trimmed_{file_name}")
+                print(f"保存到临时目录: {temp_output_path}")
 
             # 构建ffmpeg命令 - 从0秒开始裁剪指定时长
             # 使用 -t 参数指定持续时间，而不是结束时间
@@ -237,18 +279,42 @@ class VideoDurationTrim:
                 # 方法1: 尝试使用VideoFromFile (如Luma节点)
                 from comfy_api.input_impl.video_types import VideoFromFile
 
-                with open(temp_output_path, "rb") as f:
-                    video_data = BytesIO(f.read())
-                trimmed_video = VideoFromFile(video_data)
+                # VideoFromFile 期望文件路径，不是BytesIO
+                trimmed_video = VideoFromFile(temp_output_path)
+                print(f"成功使用VideoFromFile创建视频对象: {temp_output_path}")
 
             except ImportError:
                 # 方法2: 如果没有VideoFromFile，尝试其他方式
                 try:
-                    # 读取为字节数据，让ComfyUI自动处理
+                    # 尝试使用BytesIO方式
                     with open(temp_output_path, "rb") as f:
-                        trimmed_video = f.read()
+                        video_data = BytesIO(f.read())
+                        # 尝试其他可能的VIDEO构造方式
+                        from comfy_api.latest._input_impl.video_types import (
+                            VideoFromFile as VideoFromFileLatest,
+                        )
+
+                        trimmed_video = VideoFromFileLatest(video_data)
+                        print("成功使用latest VideoFromFile创建视频对象")
                 except Exception as e:
+                    print(f"BytesIO方式失败: {e}")
                     # 方法3: 返回文件路径
+                    trimmed_video = temp_output_path
+                    print(f"返回文件路径作为VIDEO类型: {temp_output_path}")
+            except Exception as e:
+                print(f"VideoFromFile创建失败: {e}")
+                # 尝试备用方案
+                try:
+                    # 尝试使用latest版本
+                    from comfy_api.latest._input_impl.video_types import (
+                        VideoFromFile as VideoFromFileLatest,
+                    )
+
+                    trimmed_video = VideoFromFileLatest(temp_output_path)
+                    print("成功使用latest VideoFromFile创建视频对象")
+                except Exception as e2:
+                    print(f"latest VideoFromFile也失败: {e2}")
+                    # 最后的备用方案：返回文件路径
                     trimmed_video = temp_output_path
                     print(f"返回文件路径作为VIDEO类型: {temp_output_path}")
 
@@ -260,18 +326,45 @@ class VideoDurationTrim:
             raise ValueError(error_msg)
 
         finally:
-            # 清理临时文件（可选，根据需要决定是否保留）
-            # 注意：如果返回的是文件路径，不应该删除临时文件
+            # 智能临时文件清理策略
             if temp_dir and os.path.exists(temp_dir):
                 try:
-                    # 如果输出路径不在临时目录中，可以安全删除临时目录
-                    if (
-                        output_path
-                        and output_path.strip()
-                        and not temp_output_path.startswith(temp_dir)
-                    ):
+                    should_cleanup = False
+
+                    if COMFYUI_INTEGRATION:
+                        # 使用ComfyUI temp目录时的清理策略
+                        if (
+                            output_path
+                            and output_path.strip()
+                            and temp_output_path
+                            and not temp_output_path.startswith(temp_dir)
+                        ):
+                            # 用户指定了输出路径且文件已复制到用户目录，可以清理
+                            should_cleanup = True
+                            cleanup_reason = "文件已保存到用户指定路径"
+                        else:
+                            # 文件在ComfyUI temp目录中，让ComfyUI自动清理
+                            should_cleanup = False
+                            cleanup_reason = "由ComfyUI自动清理（启动时清理temp目录）"
+                    else:
+                        # 非ComfyUI环境，使用传统清理策略
+                        if (
+                            output_path
+                            and output_path.strip()
+                            and temp_output_path
+                            and not temp_output_path.startswith(temp_dir)
+                        ):
+                            should_cleanup = True
+                            cleanup_reason = "文件已保存到用户指定路径"
+                        else:
+                            should_cleanup = False
+                            cleanup_reason = "保留临时文件供后续使用"
+
+                    if should_cleanup:
                         shutil.rmtree(temp_dir, ignore_errors=True)
-                        print(f"清理临时目录: {temp_dir}")
-                    # 否则保留临时文件，由系统稍后清理
+                        print(f"✅ 清理临时目录: {temp_dir} ({cleanup_reason})")
+                    else:
+                        print(f"📁 保留临时目录: {temp_dir} ({cleanup_reason})")
+
                 except Exception as e:
-                    print(f"清理临时文件时出错: {str(e)}")
+                    print(f"❌ 清理临时文件时出错: {str(e)}")
